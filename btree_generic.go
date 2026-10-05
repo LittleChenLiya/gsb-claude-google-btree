@@ -585,6 +585,10 @@ type BTreeG[T any] struct {
 	length int
 	root   *node[T]
 	cow    *copyOnWriteContext[T]
+	// gen is bumped on every content mutation (insert, replace, delete,
+	// clear). Cursors capture it so they can detect that a tree changed after
+	// they were created.
+	gen uint64
 }
 
 // LessFunc[T] determines how to order a type 'T'.  It should implement a strict
@@ -703,6 +707,7 @@ func (t *BTreeG[T]) ReplaceOrInsert(item T) (_ T, _ bool) {
 	if !outb {
 		t.length++
 	}
+	t.gen++
 	return out, outb
 }
 
@@ -739,6 +744,7 @@ func (t *BTreeG[T]) deleteItem(item T, typ toRemove) (_ T, _ bool) {
 	}
 	if outb {
 		t.length--
+		t.gen++
 	}
 	return out, outb
 }
@@ -870,6 +876,7 @@ func (t *BTreeG[T]) Clear(addNodesToFreelist bool) {
 		t.root.reset(t.cow)
 	}
 	t.root, t.length = nil, 0
+	t.gen++
 }
 
 // reset returns a subtree to the freelist.  It breaks out immediately if the
