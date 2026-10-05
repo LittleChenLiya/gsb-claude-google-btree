@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -106,6 +107,268 @@ func TestBTreeG(t *testing.T) {
 			t.Fatalf("some left!: %v", got)
 		}
 	}
+}
+
+func TestBatchG(t *testing.T) {
+	tr := NewOrderedG[int](2)
+	for i := 0; i < 10; i++ {
+		tr.ReplaceOrInsert(i)
+	}
+	// Batch: insert 10, replace 5, delete 3, insert 11.
+	err := tr.Batch([]BatchChange[int]{
+		{Op: BatchOpInsert, Item: 10},
+		{Op: BatchOpReplace, Item: 5},
+		{Op: BatchOpDelete, Item: 3},
+		{Op: BatchOpInsert, Item: 11},
+	})
+	if err != nil {
+		t.Fatalf("batch error: %v", err)
+	}
+	want := []int{0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11}
+	if got := intAll(tr); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestBatchConflictG(t *testing.T) {
+	less := func(a, b string) bool {
+		return strings.ToLower(a) < strings.ToLower(b)
+	}
+	tr := NewG[string](2, less)
+	tr.ReplaceOrInsert("apple")
+	// Batch: insert "banana", then insert "BANANA" (case-insensitive conflict).
+	err := tr.Batch([]BatchChange[string]{
+		{Op: BatchOpInsert, Item: "banana"},
+		{Op: BatchOpInsert, Item: "BANANA"},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	be, ok := err.(*BatchError[string])
+	if !ok {
+		t.Fatalf("expected *BatchError, got %T", err)
+	}
+	if be.Index != 1 {
+		t.Fatalf("expected index 1, got %d", be.Index)
+	}
+	if be.Op != BatchOpInsert {
+		t.Fatalf("expected insert op, got %s", be.Op)
+	}
+	// Tree should be unchanged.
+	if tr.Len() != 1 {
+		t.Fatalf("tree changed: len %d, want 1", tr.Len())
+	}
+	if !tr.Has("apple") {
+		t.Fatal("apple missing")
+	}
+}
+
+func TestBatchSnapshotUnchangedG(t *testing.T) {
+	tr := NewOrderedG[int](2)
+	for i := 0; i < 10; i++ {
+		tr.ReplaceOrInsert(i)
+	}
+	snap := tr.Clone()
+	// Apply a valid batch to tr.
+	err := tr.Batch([]BatchChange[int]{
+		{Op: BatchOpInsert, Item: 100},
+		{Op: BatchOpDelete, Item: 5},
+	})
+	if err != nil {
+		t.Fatalf("batch error: %v", err)
+	}
+	// tr should have the changes.
+	if tr.Len() != 10 {
+		t.Fatalf("tr len %d, want 10", tr.Len())
+	}
+	if !tr.Has(100) {
+		t.Fatal("tr missing 100")
+	}
+	if tr.Has(5) {
+		t.Fatal("tr still has 5")
+	}
+	// snap should be unchanged.
+	if snap.Len() != 10 {
+		t.Fatalf("snap len %d, want 10", snap.Len())
+	}
+	if snap.Has(100) {
+		t.Fatal("snap has 100")
+	}
+	if !snap.Has(5) {
+		t.Fatal("snap missing 5")
+	}
+}
+
+func TestBatchNoHalfCommitG(t *testing.T) {
+	tr := NewOrderedG[int](2)
+	for i := 0; i < 10; i++ {
+		tr.ReplaceOrInsert(i)
+	}
+	// Batch: insert 100 (valid), then delete 999 (invalid - not found).
+	err := tr.Batch([]BatchChange[int]{
+		{Op: BatchOpInsert, Item: 100},
+		{Op: BatchOpDelete, Item: 999},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	be, ok := err.(*BatchError[int])
+	if !ok {
+		t.Fatalf("expected *BatchError, got %T", err)
+	}
+	if be.Index != 1 {
+		t.Fatalf("expected index 1, got %d", be.Index)
+	}
+	// Tree should be unchanged (no half-commit).
+	if tr.Len() != 10 {
+		t.Fatalf("tree changed: len %d, want 10", tr.Len())
+	}
+	if tr.Has(100) {
+		t.Fatal("tree has 100 (half-commit)")
+	}
+}
+
+func TestBatchReferenceSemanticsG(t *testing.T) {
+	type ref struct {
+		value int
+	}
+	less := func(a, b *ref) bool {
+		return a.value < b.value
+	}
+	tr := NewG[*ref](2, less)
+	r := &ref{value: 1}
+	tr.ReplaceOrInsert(r)
+	// Mutate the underlying value.
+	r.value = 42
+	// The tree should see the mutation (reference semantics, not deep copy).
+	got, ok := tr.Get(&ref{value: 42})
+	if !ok {
+		t.Fatal("not found")
+	}
+	if got.value != 42 {
+		t.Fatalf("got %d, want 42 (tree should hold a reference, not a deep copy)", got.value)
+	}
+}
+
+func TestBatchEmptyG(t *testing.T) {
+	tr := NewOrderedG[int](2)
+	for i := 0; i < 5; i++ {
+		tr.ReplaceOrInsert(i)
+	}
+	if err := tr.Batch(nil); err != nil {
+		t.Fatalf("empty batch: %v", err)
+	}
+	if err := tr.Batch([]BatchChange[int]{}); err != nil {
+		t.Fatalf("empty batch: %v", err)
+	}
+	if tr.Len() != 5 {
+		t.Fatalf("len %d, want 5", tr.Len())
+	}
+}
+
+func TestBatchFirstOpFailsG(t *testing.T) {
+	tr := NewOrderedG[int](2)
+	for i := 0; i < 5; i++ {
+		tr.ReplaceOrInsert(i)
+	}
+	// First op is a delete of a non-existent item.
+	err := tr.Batch([]BatchChange[int]{
+		{Op: BatchOpDelete, Item: 999},
+		{Op: BatchOpInsert, Item: 100},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	be, ok := err.(*BatchError[int])
+	if !ok {
+		t.Fatalf("expected *BatchError, got %T", err)
+	}
+	if be.Index != 0 {
+		t.Fatalf("expected index 0, got %d", be.Index)
+	}
+	// Tree should be unchanged.
+	if tr.Len() != 5 {
+		t.Fatalf("len %d, want 5", tr.Len())
+	}
+	if tr.Has(100) {
+		t.Fatal("tree has 100")
+	}
+}
+
+func TestBatchReplaceNotFoundG(t *testing.T) {
+	tr := NewOrderedG[int](2)
+	for i := 0; i < 5; i++ {
+		tr.ReplaceOrInsert(i)
+	}
+	err := tr.Batch([]BatchChange[int]{
+		{Op: BatchOpReplace, Item: 999},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	be, ok := err.(*BatchError[int])
+	if !ok {
+		t.Fatalf("expected *BatchError, got %T", err)
+	}
+	if be.Index != 0 {
+		t.Fatalf("expected index 0, got %d", be.Index)
+	}
+	if be.Reason != "item not found" {
+		t.Fatalf("reason %q, want %q", be.Reason, "item not found")
+	}
+}
+
+func TestBatchInsertDuplicateInTreeG(t *testing.T) {
+	tr := NewOrderedG[int](2)
+	for i := 0; i < 5; i++ {
+		tr.ReplaceOrInsert(i)
+	}
+	// Insert of an item that already exists in the tree should fail.
+	err := tr.Batch([]BatchChange[int]{
+		{Op: BatchOpInsert, Item: 3},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	be, ok := err.(*BatchError[int])
+	if !ok {
+		t.Fatalf("expected *BatchError, got %T", err)
+	}
+	if be.Index != 0 {
+		t.Fatalf("expected index 0, got %d", be.Index)
+	}
+	if be.Reason != "item already exists" {
+		t.Fatalf("reason %q, want %q", be.Reason, "item already exists")
+	}
+}
+
+func ExampleBTreeG_Batch() {
+	less := func(a, b string) bool {
+		return strings.ToLower(a) < strings.ToLower(b)
+	}
+	tr := NewG[string](2, less)
+	tr.ReplaceOrInsert("apple")
+	tr.ReplaceOrInsert("banana")
+
+	// Apply a batch of four operations: insert, replace, delete, insert.
+	err := tr.Batch([]BatchChange[string]{
+		{Op: BatchOpInsert, Item: "cherry"},
+		{Op: BatchOpReplace, Item: "Apple"},
+		{Op: BatchOpDelete, Item: "banana"},
+		{Op: BatchOpInsert, Item: "date"},
+	})
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	tr.Ascend(func(s string) bool {
+		fmt.Println(s)
+		return true
+	})
+	// Output:
+	// Apple
+	// cherry
+	// date
 }
 
 func ExampleBTreeG() {

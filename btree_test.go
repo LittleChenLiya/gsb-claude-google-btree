@@ -161,6 +161,53 @@ func ExampleBTree() {
 	// len:        8
 }
 
+func TestBatch(t *testing.T) {
+	tr := New(2)
+	for _, v := range perm(10) {
+		tr.ReplaceOrInsert(v)
+	}
+	// Batch: insert 10, replace 5, delete 3, insert 11.
+	err := tr.Batch([]BatchChange[Item]{
+		{Op: BatchOpInsert, Item: Int(10)},
+		{Op: BatchOpReplace, Item: Int(5)},
+		{Op: BatchOpDelete, Item: Int(3)},
+		{Op: BatchOpInsert, Item: Int(11)},
+	})
+	if err != nil {
+		t.Fatalf("batch error: %v", err)
+	}
+	want := []Item{Int(0), Int(1), Int(2), Int(4), Int(5), Int(6), Int(7), Int(8), Int(9), Int(10), Int(11)}
+	if got := all(tr); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestBatchConflict(t *testing.T) {
+	tr := New(2)
+	tr.ReplaceOrInsert(Int(1))
+	// Insert of an item that already exists should fail.
+	err := tr.Batch([]BatchChange[Item]{
+		{Op: BatchOpInsert, Item: Int(1)},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	be, ok := err.(*BatchError[Item])
+	if !ok {
+		t.Fatalf("expected *BatchError, got %T", err)
+	}
+	if be.Index != 0 {
+		t.Fatalf("expected index 0, got %d", be.Index)
+	}
+	if be.Reason != "item already exists" {
+		t.Fatalf("reason %q, want %q", be.Reason, "item already exists")
+	}
+	// Tree should be unchanged.
+	if tr.Len() != 1 {
+		t.Fatalf("len %d, want 1", tr.Len())
+	}
+}
+
 func TestDeleteMin(t *testing.T) {
 	tr := New(3)
 	for _, v := range perm(100) {

@@ -744,6 +744,119 @@ func (t *BTree) deleteItem(item Item, typ toRemove) Item {
 	return out
 }
 
+// BatchOp is the type of a single operation in a Batch.
+type BatchOp int
+
+const (
+	// BatchOpInsert inserts an item into the tree. The operation fails if an
+	// equivalent item already exists, as determined by the item's Less method.
+	BatchOpInsert BatchOp = iota
+	// BatchOpReplace replaces an existing item in the tree. The operation fails
+	// if no equivalent item exists, as determined by the item's Less method.
+	BatchOpReplace
+	// BatchOpDelete deletes an existing item from the tree. The operation fails
+	// if no equivalent item exists, as determined by the item's Less method.
+	BatchOpDelete
+)
+
+// String returns a human-readable name for the operation.
+func (op BatchOp) String() string {
+	switch op {
+	case BatchOpInsert:
+		return "insert"
+	case BatchOpReplace:
+		return "replace"
+	case BatchOpDelete:
+		return "delete"
+	default:
+		return "unknown"
+	}
+}
+
+// BatchChange is a single operation in a Batch.
+type BatchChange struct {
+	// Op is the type of operation to perform.
+	Op BatchOp
+	// Item is the item to insert, replace, or delete.
+	Item Item
+}
+
+// BatchError is returned when a Batch cannot be applied.
+type BatchError struct {
+	// Index is the 0-based position of the failing operation in the batch.
+	Index int
+	// Op is the type of the failing operation.
+	Op BatchOp
+	// Item is the item that the failing operation targeted.
+	Item Item
+	// Reason describes why the operation failed.
+	Reason string
+}
+
+func (e *BatchError) Error() string {
+	return fmt.Sprintf("btree: batch operation %d (%s %v) failed: %s", e.Index, e.Op, e.Item, e.Reason)
+}
+
+// Batch applies a sequence of changes atomically.
+//
+// All changes are validated before the tree is updated. Validation uses each
+// item's Less method to determine equivalence between items (not Go's ==
+// operator), so types with custom equivalence (e.g. case-insensitive strings)
+// are handled correctly.
+//
+// The following checks are performed, in declaration order:
+//   - BatchOpInsert fails if an equivalent item already exists in the tree, or
+//     if an equivalent item was the target of an earlier insert in the batch.
+//   - BatchOpReplace fails if no equivalent item exists in the tree.
+//   - BatchOpDelete fails if no equivalent item exists in the tree.
+//
+// If any check fails, a *BatchError is returned and the tree is unchanged.
+// Otherwise, all changes are applied in declaration order, and the tree is
+// updated.
+//
+// Batch is atomic: if any operation fails, none of the operations are applied.
+// The tree is updated only after all operations have been validated and applied
+// to a copy.
+//
+// Batch does not deep-copy items. For reference types (pointers, slices, maps,
+// channels, etc.), the tree holds a reference to the item; mutating the
+// underlying value after inserting it will be visible to the tree. Callers are
+// responsible for not mutating items that have been inserted.
+func (t *BTree) Batch(changes []BatchChange) error {
+	if len(changes) == 0 {
+		return nil
+	}
+	// Validate and apply against a copy-on-write snapshot. The snapshot shares
+	// the tree's nodes until a write occurs, at which point the affected nodes
+	// are copied. If any check fails, the snapshot is discarded and the original
+	// tree is left untouched.
+	snap := t.Clone()
+	for i, c := range changes {
+		switch c.Op {
+		case BatchOpInsert:
+			if snap.Get(c.Item) != nil {
+				return &BatchError{Index: i, Op: c.Op, Item: c.Item, Reason: "item already exists"}
+			}
+			snap.ReplaceOrInsert(c.Item)
+		case BatchOpReplace:
+			if snap.Get(c.Item) == nil {
+				return &BatchError{Index: i, Op: c.Op, Item: c.Item, Reason: "item not found"}
+			}
+			snap.ReplaceOrInsert(c.Item)
+		case BatchOpDelete:
+			if snap.Get(c.Item) == nil {
+				return &BatchError{Index: i, Op: c.Op, Item: c.Item, Reason: "item not found"}
+			}
+			snap.Delete(c.Item)
+		default:
+			return &BatchError{Index: i, Op: c.Op, Item: c.Item, Reason: "unknown operation"}
+		}
+	}
+	// All checks passed; publish the snapshot.
+	*t = *snap
+	return nil
+}
+
 // AscendRange calls the iterator for every value in the tree within the range
 // [greaterOrEqual, lessThan), until iterator returns false.
 func (t *BTree) AscendRange(greaterOrEqual, lessThan Item, iterator ItemIterator) {
