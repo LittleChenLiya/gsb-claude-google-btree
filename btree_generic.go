@@ -162,6 +162,153 @@ func NewWithFreeListG[T any](degree int, less LessFunc[T], f *FreeListG[T]) *BTr
 	}
 }
 
+// DuplicatePolicy determines how the sorted-batch constructors
+// (NewFromSortedG, NewOrderedFromSortedG, NewWithFreeListFromSortedG,
+// NewFromSorted, NewWithFreeListFromSorted) handle input items that compare
+// equal to their predecessor.
+type DuplicatePolicy int
+
+const (
+	// RejectDuplicates makes the sorted-batch constructors fail with a
+	// *SortedBatchError when two adjacent input items compare equal.
+	RejectDuplicates DuplicatePolicy = iota
+	// KeepLastDuplicate makes the sorted-batch constructors keep the last
+	// item of each run of equal items, mirroring ReplaceOrInsert semantics
+	// where a later insertion replaces an earlier equal item.
+	KeepLastDuplicate
+)
+
+// SortedBatchError describes a precheck failure of a sorted-batch build.
+// Index is the offset of the offending item in the original input batch:
+// either the first item that is smaller than its predecessor (out-of-order
+// input) or the first item equal to its predecessor while the
+// RejectDuplicates policy is in effect.
+type SortedBatchError struct {
+	Index     int  // index of the offending item in the original input batch
+	Duplicate bool // true if the item equals its predecessor, false if it is out of order
+}
+
+func (e *SortedBatchError) Error() string {
+	if e.Duplicate {
+		return fmt.Sprintf("btree: sorted batch: duplicate item at input index %d", e.Index)
+	}
+	return fmt.Sprintf("btree: sorted batch: out-of-order item at input index %d", e.Index)
+}
+
+// checkSortedBatch validates that batch is in non-decreasing order according
+// to less, applying the given duplicate policy.  It returns the items to load
+// into the tree: the batch itself when it is already duplicate-free, or a
+// compacted copy when KeepLastDuplicate dropped the earlier items of each
+// equal run.  The input batch is never mutated, and no FreeList node is
+// acquired before this function has returned a nil error.
+func checkSortedBatch[T any](batch []T, less LessFunc[T], policy DuplicatePolicy) ([]T, error) {
+	hasDup := false
+	for i := 1; i < len(batch); i++ {
+		prev, cur := batch[i-1], batch[i]
+		if less(cur, prev) {
+			return nil, &SortedBatchError{Index: i}
+		}
+		if !less(prev, cur) {
+			if policy == RejectDuplicates {
+				return nil, &SortedBatchError{Index: i, Duplicate: true}
+			}
+			hasDup = true
+		}
+	}
+	if !hasDup {
+		return batch, nil
+	}
+	// KeepLastDuplicate: compact into a fresh slice, keeping only the last
+	// item of each run of equal items.
+	out := make([]T, 0, len(batch))
+	for i := 0; i < len(batch); i++ {
+		if i+1 < len(batch) && !less(batch[i], batch[i+1]) {
+			continue // an equal item follows; keep the last of the run
+		}
+		out = append(out, batch[i])
+	}
+	return out, nil
+}
+
+// NewFromSortedG creates a new B-Tree bulk-loaded from sorted, a batch of
+// items that must be in non-decreasing order according to less.  The batch is
+// checked with less before any node is acquired from a FreeList: out-of-order
+// items always fail with a *SortedBatchError, and equal adjacent items either
+// fail (RejectDuplicates) or are compacted keeping the last item of each
+// equal run (KeepLastDuplicate).  On precheck failure no FreeList node is
+// acquired and the returned tree is nil.
+func NewFromSortedG[T any](degree int, less LessFunc[T], sorted []T, policy DuplicatePolicy) (*BTreeG[T], error) {
+	return NewWithFreeListFromSortedG(degree, less, NewFreeListG[T](DefaultFreeListSize), sorted, policy)
+}
+
+// NewOrderedFromSortedG is NewFromSortedG for ordered types, using the
+// default Less[T] ordering.
+func NewOrderedFromSortedG[T Ordered](degree int, sorted []T, policy DuplicatePolicy) (*BTreeG[T], error) {
+	return NewWithFreeListFromSortedG(degree, Less[T](), NewFreeListG[T](DefaultFreeListSize), sorted, policy)
+}
+
+// NewWithFreeListFromSortedG creates a new B-Tree that uses the given node
+// free list, bulk-loaded from a sorted batch of items.  It behaves exactly
+// like NewFromSortedG; on precheck failure the free list is left untouched.
+func NewWithFreeListFromSortedG[T any](degree int, less LessFunc[T], f *FreeListG[T], sorted []T, policy DuplicatePolicy) (*BTreeG[T], error) {
+	t := NewWithFreeListG(degree, less, f)
+	items, err := checkSortedBatch(sorted, less, policy)
+	if err != nil {
+		return nil, err
+	}
+	t.loadSorted(items)
+	return t, nil
+}
+
+// loadSorted bulk-loads sorted, duplicate-free items into an empty tree,
+// building nodes along the existing node/free-list structure.
+func (t *BTreeG[T]) loadSorted(batch []T) {
+	if len(batch) == 0 {
+		return
+	}
+	t.root = t.buildSortedNode(batch)
+	t.length = len(batch)
+}
+
+// buildSortedNode builds a subtree from sorted, duplicate-free items,
+// acquiring every node from the tree's FreeList via its copy-on-write
+// context.  Items are distributed over the levels so that each item is
+// stored exactly once: groups of at most childCap items are built into
+// child subtrees, and the single items between adjacent groups become this
+// node's items.
+func (t *BTreeG[T]) buildSortedNode(batch []T) *node[T] {
+	maxItems := t.maxItems()
+	n := t.cow.newNode()
+	if len(batch) <= maxItems {
+		n.items = append(n.items, batch...)
+		return n
+	}
+	// childCap is the maximum number of items a child subtree can hold.
+	childCap := maxItems
+	for (maxItems+1)*(childCap+1)-1 < len(batch) {
+		childCap = (maxItems+1)*(childCap+1) - 1
+	}
+	// Split batch into groups of at most childCap items, separated by single
+	// items that become this node's items.
+	groups := (len(batch) + childCap + 1) / (childCap + 1) // ceil((len+1)/(childCap+1))
+	fill := len(batch) - (groups - 1)                  // items stored within children
+	base, rem := fill/groups, fill%groups
+	pos := 0
+	for i := 0; i < groups; i++ {
+		size := base
+		if i < rem {
+			size++
+		}
+		n.children = append(n.children, t.buildSortedNode(batch[pos:pos+size]))
+		pos += size
+		if i < groups-1 {
+			n.items = append(n.items, batch[pos])
+			pos++
+		}
+	}
+	return n
+}
+
 // items stores items in a node.
 type items[T any] []T
 
@@ -928,6 +1075,26 @@ func NewFreeList(size int) *FreeList {
 // NewWithFreeList creates a new B-Tree that uses the given node free list.
 func NewWithFreeList(degree int, f *FreeList) *BTree {
 	return (*BTree)(NewWithFreeListG[Item](degree, itemLess, (*FreeListG[Item])(f)))
+}
+
+// NewFromSorted creates a new B-Tree bulk-loaded from sorted, a batch of
+// items that must be in non-decreasing order according to Item.Less.  It
+// shares the semantics of NewFromSortedG: out-of-order items always fail with
+// a *SortedBatchError, and equal adjacent items either fail
+// (RejectDuplicates) or are compacted keeping the last item of each equal run
+// (KeepLastDuplicate).  On precheck failure no FreeList node is acquired and
+// the returned tree is nil.
+func NewFromSorted(degree int, sorted []Item, policy DuplicatePolicy) (*BTree, error) {
+	t, err := NewFromSortedG[Item](degree, itemLess, sorted, policy)
+	return (*BTree)(t), err
+}
+
+// NewWithFreeListFromSorted creates a new B-Tree that uses the given node
+// free list, bulk-loaded from a sorted batch of items.  It behaves exactly
+// like NewFromSorted; on precheck failure the free list is left untouched.
+func NewWithFreeListFromSorted(degree int, f *FreeList, sorted []Item, policy DuplicatePolicy) (*BTree, error) {
+	t, err := NewWithFreeListFromSortedG[Item](degree, itemLess, (*FreeListG[Item])(f), sorted, policy)
+	return (*BTree)(t), err
 }
 
 // ItemIterator allows callers of Ascend* to iterate in-order over portions of
