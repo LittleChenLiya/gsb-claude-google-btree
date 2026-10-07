@@ -866,10 +866,40 @@ func (t *BTree) Len() int {
 //       iterated over looking for nodes to add to the freelist, and due to
 //       ownership, none are.
 func (t *BTree) Clear(addNodesToFreelist bool) {
-	if t.root != nil && addNodesToFreelist {
-		t.root.reset(t.cow)
+	t.ClearWithItemIterator(addNodesToFreelist, nil)
+}
+
+// ClearWithItemIterator removes all items from the btree, behaving exactly
+// like Clear, and additionally calls the optional iterator (when non-nil)
+// for every item currently visible in this tree, in ascending order, before
+// the tree is emptied.
+//
+// The iteration is read-only and only observes items reachable from this
+// tree's root; nodes shared with lazily-cloned trees are never mutated by
+// the iteration or by the cleanup, so clones keep their data intact.  The
+// iterator must not modify this tree while it is being called.
+//
+// If the iterator returns false, iteration stops early; the tree is still
+// fully emptied.  The return value reports how many items had been
+// successfully notified (i.e. for which the iterator returned true) before
+// the tree was cleared.
+func (t *BTree) ClearWithItemIterator(addNodesToFreelist bool, iterator ItemIterator) (notified int) {
+	if t.root != nil {
+		if iterator != nil {
+			t.root.iterate(ascend, nil, nil, false, false, func(item Item) bool {
+				if !iterator(item) {
+					return false
+				}
+				notified++
+				return true
+			})
+		}
+		if addNodesToFreelist {
+			t.root.reset(t.cow)
+		}
 	}
 	t.root, t.length = nil, 0
+	return notified
 }
 
 // reset returns a subtree to the freelist.  It breaks out immediately if the

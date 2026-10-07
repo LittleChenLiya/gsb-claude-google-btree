@@ -790,3 +790,62 @@ func BenchmarkDeleteAndRestore(b *testing.B) {
 		}
 	})
 }
+
+// TestClearWithItemIterator exercises the optional per-item callback of tree
+// clearing on the Item-based API: three cloned trees diverge, one side is
+// cleared with the callback failing on the second visible item, and the
+// notified count, emptied state, and the other side's ordering are checked.
+func TestClearWithItemIterator(t *testing.T) {
+	const size = 100
+	t1 := New(*btreeDegree)
+	for _, v := range rand.Perm(size) {
+		t1.ReplaceOrInsert(Int(v))
+	}
+	t2 := t1.Clone()
+	t3 := t1.Clone()
+	// Each tree diverges with its own copy-on-write modifications.
+	t1.ReplaceOrInsert(Int(size + 1))
+	t1.Delete(Int(10))
+	t2.ReplaceOrInsert(Int(size + 2))
+	t2.Delete(Int(20))
+	t3.ReplaceOrInsert(Int(size + 3))
+	t3.Delete(Int(30))
+
+	want1 := all(t1)
+	want2 := all(t2)
+	want3 := all(t3)
+
+	// Clear one side (t2), failing the callback on the second visible item.
+	var got []Item
+	notified := t2.ClearWithItemIterator(true, func(item Item) bool {
+		if len(got) == 1 { // second visible item: report failure
+			return false
+		}
+		got = append(got, item)
+		return true
+	})
+	if notified != 1 {
+		t.Errorf("notified = %d, want 1 (only the first item was accepted)", notified)
+	}
+	if len(got) != 1 || got[0] != want2[0] {
+		t.Errorf("notified items = %v, want [%v]", got, want2[0])
+	}
+	if t2.Len() != 0 || len(all(t2)) != 0 {
+		t.Errorf("cleared tree not empty: len=%d items=%v", t2.Len(), all(t2))
+	}
+	// The other clones must be untouched and still ordered.
+	if got1 := all(t1); !reflect.DeepEqual(got1, want1) {
+		t.Errorf("t1 changed by clearing t2: got %v, want %v", got1, want1)
+	}
+	if got3 := all(t3); !reflect.DeepEqual(got3, want3) {
+		t.Errorf("t3 changed by clearing t2: got %v, want %v", got3, want3)
+	}
+	t.Logf("cleared t2: notified=%d, callback failed at item %v, emptied (len=%d)", notified, want2[1], t2.Len())
+	t.Logf("t1 intact, first items: %v", want1[:5])
+	t.Logf("t3 intact, first items: %v", want3[:5])
+
+	// A nil iterator behaves exactly like Clear.
+	if notified = t1.ClearWithItemIterator(true, nil); notified != 0 || t1.Len() != 0 {
+		t.Errorf("nil iterator: notified=%d len=%d, want 0/0", notified, t1.Len())
+	}
+}

@@ -762,3 +762,79 @@ func BenchmarkDeleteAndRestoreG(b *testing.B) {
 		}
 	})
 }
+
+// TestClearWithItemIteratorG verifies the optional per-item callback of tree
+// clearing: it only observes items currently visible in the tree being
+// cleared, the notified count is reported when the callback fails, the
+// cleared tree is emptied either way, and lazily-cloned sibling trees keep
+// their data and ordering intact.
+func TestClearWithItemIteratorG(t *testing.T) {
+	const size = 100
+	// One base tree, cloned twice: three trees sharing the original nodes.
+	t1 := NewOrderedG[int](*btreeDegree)
+	for _, v := range rand.Perm(size) {
+		t1.ReplaceOrInsert(v)
+	}
+	t2 := t1.Clone()
+	t3 := t1.Clone()
+	// Each tree diverges with its own copy-on-write modifications.
+	t1.ReplaceOrInsert(size + 1)
+	t1.Delete(10)
+	t2.ReplaceOrInsert(size + 2)
+	t2.Delete(20)
+	t3.ReplaceOrInsert(size + 3)
+	t3.Delete(30)
+
+	want1 := intAll(t1)
+	want2 := intAll(t2)
+	want3 := intAll(t3)
+
+	// Clear one side (t2), failing the callback on the second visible item.
+	var got []int
+	notified := t2.ClearWithItemIterator(true, func(item int) bool {
+		if len(got) == 1 { // second visible item: report failure
+			return false
+		}
+		got = append(got, item)
+		return true
+	})
+	if notified != 1 {
+		t.Errorf("notified = %d, want 1 (only the first item was accepted)", notified)
+	}
+	if len(got) != 1 || got[0] != want2[0] {
+		t.Errorf("notified items = %v, want [%v]", got, want2[0])
+	}
+	if t2.Len() != 0 || len(intAll(t2)) != 0 {
+		t.Errorf("cleared tree not empty: len=%d items=%v", t2.Len(), intAll(t2))
+	}
+	// The other clones must be untouched and still ordered.
+	if got1 := intAll(t1); !reflect.DeepEqual(got1, want1) {
+		t.Errorf("t1 changed by clearing t2: got %v, want %v", got1, want1)
+	}
+	if got3 := intAll(t3); !reflect.DeepEqual(got3, want3) {
+		t.Errorf("t3 changed by clearing t2: got %v, want %v", got3, want3)
+	}
+	t.Logf("cleared t2: notified=%d, callback failed at item %v, emptied (len=%d)", notified, want2[1], t2.Len())
+	t.Logf("t1 intact, first items: %v", want1[:5])
+	t.Logf("t3 intact, first items: %v", want3[:5])
+
+	// A fully successful callback observes exactly the tree's visible items,
+	// in ascending order, and the count matches the tree length.
+	var seen []int
+	notified = t3.ClearWithItemIterator(false, func(item int) bool {
+		seen = append(seen, item)
+		return true
+	})
+	if notified != len(want3) || !reflect.DeepEqual(seen, want3) {
+		t.Errorf("full clear: notified=%d seen=%v, want %d items %v", notified, seen, len(want3), want3)
+	}
+	if t3.Len() != 0 {
+		t.Errorf("t3 not emptied: len=%d", t3.Len())
+	}
+	t.Logf("cleared t3: notified=%d (all items), emptied (len=%d)", notified, t3.Len())
+
+	// A nil iterator behaves exactly like Clear.
+	if notified = t1.ClearWithItemIterator(true, nil); notified != 0 || t1.Len() != 0 {
+		t.Errorf("nil iterator: notified=%d len=%d, want 0/0", notified, t1.Len())
+	}
+}
