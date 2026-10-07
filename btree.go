@@ -51,6 +51,7 @@
 package btree
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -882,6 +883,213 @@ func (n *node) reset(c *copyOnWriteContext) bool {
 		}
 	}
 	return c.freeNode(n) != ftFreelistFull
+}
+
+// DuplicatePolicy determines how LoadOrdered handles equal keys found while
+// preflighting an ordered batch of items.
+type DuplicatePolicy int
+
+const (
+	// RejectDuplicates makes LoadOrdered fail with a LoadError whose Kind is
+	// KindDuplicate if a key appears more than once in the ordered batch.
+	RejectDuplicates DuplicatePolicy = iota
+	// LastWins makes LoadOrdered keep the last item of every run of equal keys
+	// while discarding the earlier occurrences.
+	LastWins
+)
+
+func (p DuplicatePolicy) valid() bool {
+	return p == RejectDuplicates || p == LastWins
+}
+
+// LoadErrorKind classifies an ordered-batch preflight failure.
+type LoadErrorKind int
+
+const (
+	// KindOutOfOrder indicates that the batch contained an item that was not
+	// strictly greater than the previous one.
+	KindOutOfOrder LoadErrorKind = iota
+	// KindDuplicate indicates that the batch contained two equal keys while
+	// the RejectDuplicates policy was in effect.
+	KindDuplicate
+)
+
+// ErrTreeNotEmpty is returned by LoadOrdered when called on a tree that
+// already contains items.
+var ErrTreeNotEmpty = errors.New("btree: LoadOrdered called on a non-empty tree")
+
+// LoadError describes why an ordered-batch preflight failed.  Index is the
+// index within the input batch of the offending item: for KindOutOfOrder it is
+// the index of the item that broke the strict ordering, and for KindDuplicate
+// it is the index of the later occurrence of the duplicated key.
+type LoadError struct {
+	Kind  LoadErrorKind
+	Index int
+	Item  Item
+}
+
+func (e *LoadError) Error() string {
+	switch e.Kind {
+	case KindDuplicate:
+		return fmt.Sprintf("btree: duplicate key at index %d (%v)", e.Index, e.Item)
+	default:
+		return fmt.Sprintf("btree: items are not in order at index %d (%v)", e.Index, e.Item)
+	}
+}
+
+// preflightOrdered validates that items are provided in strictly ascending
+// order (using the items' real Less methods) and applies the duplicate
+// policy.  It returns the items that should populate the tree.  The returned
+// slice may alias the input.  No freelist nodes are touched by this function,
+// so a failed preflight leaves the tree's FreeList untouched.
+func preflightOrdered(items []Item, policy DuplicatePolicy) ([]Item, *LoadError) {
+	if len(items) < 2 {
+		return items, nil
+	}
+	out := items[:1]
+	for i := 1; i < len(items); i++ {
+		prev := items[i-1]
+		item := items[i]
+		switch {
+		case item.Less(prev):
+			return nil, &LoadError{Kind: KindOutOfOrder, Index: i, Item: item}
+		case !prev.Less(item):
+			if policy == RejectDuplicates {
+				return nil, &LoadError{Kind: KindDuplicate, Index: i, Item: item}
+			}
+			// LastWins: replace the previous (equal) item in the compacted run.
+			out[len(out)-1] = item
+		default:
+			out = append(out, item)
+		}
+	}
+	return out, nil
+}
+
+// balancedSplit returns the number of children per group when n nodes are
+// packed into internal nodes holding at most maxItems items (maxItems+1
+// children).  Group sizes differ by at most one and every group but the root
+// has at least minItems+1 children.
+func balancedSplit(n, maxItems, minItems int) (groups, base, extra int) {
+	groups = (n + maxItems) / (maxItems + 1)
+	base, extra = n/groups, n%groups
+	return
+}
+
+// bulkBuildOrdered constructs a balanced tree from the given strictly ordered
+// in items, reusing the copy-on-write context (and therefore the FreeList) of
+// the receiving tree.  Nodes are built along the existing node structure:
+// each node is a node created through the cow, so FreeList reuse applies.
+func bulkBuildOrdered(cow *copyOnWriteContext, in items, maxItems, minItems int) *node {
+	if len(in) == 0 {
+		return nil
+	}
+	// Partition the items into leaves.  With L leaves, L-1 items are reserved
+	// as separators in internal levels, so the leaves hold n-(L-1) items.
+	n := len(in)
+	// L is the smallest leaf count with nLeaf = n-L+1 items packing into L
+	// leaves of at most maxItems each: L = ceil((n+1)/(maxItems+1)).
+	L := (n + 1 + maxItems) / (maxItems + 1)
+	nLeaf := n - (L - 1)
+	leafBase, leafExtra := nLeaf/L, nLeaf%L
+
+	level := make(children, 0, L)
+	for i := 0; i < L; i++ {
+		level = append(level, cow.newNode())
+	}
+
+	// Build internal levels bottom-up, each level packed in balanced groups.
+	for len(level) > 1 {
+		groups, childBase, childExtra := balancedSplit(len(level), maxItems, minItems)
+		parents := make(children, 0, groups)
+		for g := 0; g < groups; g++ {
+			count := childBase
+			if g < childExtra {
+				count++
+			}
+			parent := cow.newNode()
+			parent.children = append(parent.children, level[:count]...)
+			parent.items = append(parent.items, make(items, count-1)...)
+			parents = append(parents, parent)
+			level = level[count:]
+		}
+		level = parents
+	}
+	root := level[0]
+
+	// Fill all items with one in-order walk.  Leaf nodes receive balanced
+	// chunks of the first nLeaf items; each internal separator is placed at
+	// its in-order position (between the adjacent child subtrees), so the
+	// resulting order matches the input exactly.
+	idx := 0
+	leafIdx := 0
+	var fill func(*node)
+	fill = func(nn *node) {
+		if len(nn.children) == 0 {
+			size := leafBase
+			if leafIdx < leafExtra {
+				size++
+			}
+			nn.items = append(nn.items, in[idx:idx+size]...)
+			idx += size
+			leafIdx++
+			return
+		}
+		for i, child := range nn.children {
+			fill(child)
+			if i < len(nn.items) {
+				nn.items[i] = in[idx]
+				idx++
+			}
+		}
+	}
+	fill(root)
+	return root
+}
+
+// LoadOrdered bulk-loads the given items into t, which must be empty.  The
+// items must be given in ascending order according to their Less methods; the
+// ordering is verified with real Less comparisons before any nodes are taken
+// from the FreeList.  policy selects whether duplicate keys are rejected or
+// the last item of a run of equal keys wins.
+//
+// On a preflight failure, LoadOrdered returns a *LoadError describing the
+// offending input index, leaves t empty, and never touches its FreeList.
+//
+// nil cannot be added to the tree (will panic).
+//
+// Note that with LastWins the returned tree may retain the same backing arrays
+// as the input slice; callers must not mutate the slice afterwards.
+func (t *BTree) LoadOrdered(items []Item, policy DuplicatePolicy) error {
+	if t.length != 0 || t.root != nil {
+		return ErrTreeNotEmpty
+	}
+	for _, item := range items {
+		if item == nil {
+			panic("nil item being added to BTree")
+		}
+	}
+	if !policy.valid() {
+		return fmt.Errorf("btree: invalid duplicate policy %d", policy)
+	}
+	ordered, err := preflightOrdered(items, policy)
+	if err != nil {
+		return err
+	}
+	t.root = bulkBuildOrdered(t.cow, ordered, t.maxItems(), t.minItems())
+	t.length = len(ordered)
+	return nil
+}
+
+// NewFromOrdered creates a new B-Tree from the given ordered items.  See
+// BTree.LoadOrdered for the ordering and duplicate policy requirements; a
+// preflight failure is reported in the returned error.
+func NewFromOrdered(degree int, items []Item, policy DuplicatePolicy) (*BTree, error) {
+	t := New(degree)
+	if err := t.LoadOrdered(items, policy); err != nil {
+		return nil, err
+	}
+	return t, nil
 }
 
 // Int implements the Item interface for integers.
