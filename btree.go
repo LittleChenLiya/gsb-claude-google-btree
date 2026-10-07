@@ -872,6 +872,43 @@ func (t *BTree) Clear(addNodesToFreelist bool) {
 	t.root, t.length = nil, 0
 }
 
+// ClearWithCallback removes all items from the btree, calling cb once for
+// each item currently visible in this tree, in ascending order, before the
+// tree is emptied.  It returns the number of items cb was invoked with
+// (the number of items notified).
+//
+// Only items reachable from this tree are reported: nodes shared with
+// clones of this tree are traversed read-only and are never mutated by the
+// notification pass, so clones keep their own view of the data intact.
+//
+// If cb returns false, notification stops early; the tree is still fully
+// emptied and the count of items notified so far (including the item for
+// which cb returned false) is returned.
+//
+// cb may be nil, in which case no notification happens and the call is
+// equivalent to Clear(addNodesToFreelist), returning 0.
+//
+// cb must not mutate the tree being cleared.
+//
+// If addNodesToFreelist is true, t's nodes are added to its freelist as
+// part of this call (after notification completes), until the freelist is
+// full; see Clear for the complexity details.
+func (t *BTree) ClearWithCallback(addNodesToFreelist bool, cb ItemIterator) (notified int) {
+	if t.root != nil {
+		if cb != nil {
+			t.root.iterate(ascend, nil, nil, false, false, func(item Item) bool {
+				notified++
+				return cb(item)
+			})
+		}
+		if addNodesToFreelist {
+			t.root.reset(t.cow)
+		}
+	}
+	t.root, t.length = nil, 0
+	return notified
+}
+
 // reset returns a subtree to the freelist.  It breaks out immediately if the
 // freelist is full, since the only benefit of iterating is to fill that
 // freelist up.  Returns true if parent reset call should continue.

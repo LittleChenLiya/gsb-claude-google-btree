@@ -347,6 +347,71 @@ func TestDescendGreaterThan(t *testing.T) {
 	}
 }
 
+// TestClearWithCallback clones a tree twice, mutates all three trees, then
+// clears one clone with a callback that fails on the second item.  It
+// verifies the notified count, that the cleared tree is emptied, and that
+// the other trees keep their full, ordered contents.
+func TestClearWithCallback(t *testing.T) {
+	tr := New(*btreeDegree)
+	for _, v := range perm(100) {
+		tr.ReplaceOrInsert(v)
+	}
+	c1 := tr.Clone()
+	c2 := tr.Clone()
+	// Each of the three trees diverges from the shared structure.
+	tr.ReplaceOrInsert(Int(-1))   // only visible in tr
+	c1.Delete(Int(42))            // 42 no longer visible in c1
+	c2.ReplaceOrInsert(Int(1000)) // only visible in c2
+
+	// Clear c1; the callback fails on the second notified item.
+	var got []Item
+	notified := c1.ClearWithCallback(true, func(a Item) bool {
+		got = append(got, a)
+		return len(got) < 2
+	})
+	if want := 2; notified != want {
+		t.Fatalf("notified: got %d, want %d", notified, want)
+	}
+	// c1's visible items are 0..99 minus 42, so the first two are 0 and 1.
+	if want := []Item{Int(0), Int(1)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("notified items:\n got: %v\nwant: %v", got, want)
+	}
+	if c1.Len() != 0 {
+		t.Fatalf("cleared tree length: got %d, want 0", c1.Len())
+	}
+	if items := all(c1); len(items) != 0 {
+		t.Fatalf("cleared tree not empty: %v", items)
+	}
+	// The other two trees must be intact and in order.
+	wantTr := append([]Item{Int(-1)}, rang(100)...)
+	if gotTr := all(tr); !reflect.DeepEqual(gotTr, wantTr) {
+		t.Fatalf("original tree corrupted:\n got: %v\nwant: %v", gotTr, wantTr)
+	}
+	wantC2 := append(rang(100), Int(1000))
+	if gotC2 := all(c2); !reflect.DeepEqual(gotC2, wantC2) {
+		t.Fatalf("clone corrupted:\n got: %v\nwant: %v", gotC2, wantC2)
+	}
+}
+
+// TestClearWithCallbackNil verifies that a nil callback makes
+// ClearWithCallback behave like Clear and report zero notifications.
+func TestClearWithCallbackNil(t *testing.T) {
+	tr := New(*btreeDegree)
+	for _, v := range perm(100) {
+		tr.ReplaceOrInsert(v)
+	}
+	clone := tr.Clone()
+	if notified := clone.ClearWithCallback(true, nil); notified != 0 {
+		t.Fatalf("notified: got %d, want 0", notified)
+	}
+	if clone.Len() != 0 {
+		t.Fatalf("cleared tree length: got %d, want 0", clone.Len())
+	}
+	if got := all(tr); !reflect.DeepEqual(got, rang(100)) {
+		t.Fatalf("original tree corrupted:\n got: %v", got)
+	}
+}
+
 const benchmarkTreeSize = 10000
 
 func BenchmarkInsert(b *testing.B) {

@@ -334,6 +334,131 @@ func TestDescendGreaterThanG(t *testing.T) {
 	}
 }
 
+// TestClearWithCallbackCloneG clones a tree twice, mutates all three trees,
+// then clears one clone with a callback that fails on the second item.  It
+// verifies the notified count, that the cleared tree is emptied, and that
+// the other trees keep their full, ordered contents.
+func TestClearWithCallbackCloneG(t *testing.T) {
+	const treeSize = 100
+	tr := NewOrderedG[int](*btreeDegree)
+	for _, v := range rand.Perm(treeSize) {
+		tr.ReplaceOrInsert(v)
+	}
+	c1 := tr.Clone()
+	c2 := tr.Clone()
+	// Each of the three trees diverges from the shared structure.
+	tr.ReplaceOrInsert(-1)   // only visible in tr
+	c1.Delete(42)            // 42 no longer visible in c1
+	c2.ReplaceOrInsert(1000) // only visible in c2
+
+	// Clear c1; the callback fails on the second notified item.
+	var got []int
+	notified := c1.ClearWithCallback(true, func(a int) bool {
+		got = append(got, a)
+		return len(got) < 2
+	})
+	if want := 2; notified != want {
+		t.Fatalf("notified: got %d, want %d", notified, want)
+	}
+	// c1's visible items are 0..99 minus 42, so the first two are 0 and 1.
+	if want := []int{0, 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("notified items:\n got: %v\nwant: %v", got, want)
+	}
+	if c1.Len() != 0 {
+		t.Fatalf("cleared tree length: got %d, want 0", c1.Len())
+	}
+	if items := intAll(c1); len(items) != 0 {
+		t.Fatalf("cleared tree not empty: %v", items)
+	}
+	// The other two trees must be intact and in order.
+	wantTr := append([]int{-1}, intRange(treeSize, false)...)
+	if gotTr := intAll(tr); !reflect.DeepEqual(gotTr, wantTr) {
+		t.Fatalf("original tree corrupted:\n got: %v\nwant: %v", gotTr, wantTr)
+	}
+	wantC2 := append(intRange(treeSize, false), 1000)
+	if gotC2 := intAll(c2); !reflect.DeepEqual(gotC2, wantC2) {
+		t.Fatalf("clone corrupted:\n got: %v\nwant: %v", gotC2, wantC2)
+	}
+}
+
+// TestClearWithCallbackFullG verifies that a fully-successful callback is
+// notified of exactly the items visible in the cleared tree, in ascending
+// order, and that shared clone nodes are not disturbed.
+func TestClearWithCallbackFullG(t *testing.T) {
+	const treeSize = 100
+	tr := NewOrderedG[int](*btreeDegree)
+	for _, v := range rand.Perm(treeSize) {
+		tr.ReplaceOrInsert(v)
+	}
+	clone := tr.Clone()
+	// Diverge: 7 and 8 are only visible in tr, -1 only in clone.
+	clone.Delete(7)
+	clone.Delete(8)
+	clone.ReplaceOrInsert(-1)
+
+	var got []int
+	notified := clone.ClearWithCallback(true, func(a int) bool {
+		got = append(got, a)
+		return true
+	})
+	want := append([]int{-1}, intRange(treeSize, false)[0:7]...)
+	want = append(want, intRange(treeSize, false)[9:]...)
+	if wantNotified := treeSize - 1; notified != wantNotified {
+		t.Fatalf("notified: got %d, want %d", notified, wantNotified)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("notified items:\n got: %v\nwant: %v", got, want)
+	}
+	if clone.Len() != 0 {
+		t.Fatalf("cleared tree length: got %d, want 0", clone.Len())
+	}
+	// The original tree is untouched.
+	if gotTr := intAll(tr); !reflect.DeepEqual(gotTr, intRange(treeSize, false)) {
+		t.Fatalf("original tree corrupted:\n got: %v", gotTr)
+	}
+}
+
+// TestClearWithCallbackNilG verifies that a nil callback makes
+// ClearWithCallback behave like Clear and report zero notifications.
+func TestClearWithCallbackNilG(t *testing.T) {
+	tr := NewOrderedG[int](*btreeDegree)
+	for _, v := range rand.Perm(100) {
+		tr.ReplaceOrInsert(v)
+	}
+	clone := tr.Clone()
+	if notified := clone.ClearWithCallback(true, nil); notified != 0 {
+		t.Fatalf("notified: got %d, want 0", notified)
+	}
+	if clone.Len() != 0 {
+		t.Fatalf("cleared tree length: got %d, want 0", clone.Len())
+	}
+	if got := intAll(tr); !reflect.DeepEqual(got, intRange(100, false)) {
+		t.Fatalf("original tree corrupted:\n got: %v", got)
+	}
+}
+
+func ExampleBTreeG_ClearWithCallback() {
+	tr := NewOrderedG[int](2)
+	for i := 0; i < 5; i++ {
+		tr.ReplaceOrInsert(i)
+	}
+	clone := tr.Clone()
+	clone.Delete(2) // diverge: 2 is no longer visible in the clone
+	notified := clone.ClearWithCallback(true, func(a int) bool {
+		fmt.Println("notify:", a)
+		return a != 1 // fail on the second notified item
+	})
+	fmt.Println("notified: ", notified)
+	fmt.Println("clone len:", clone.Len())
+	fmt.Println("orig:     ", intAll(tr))
+	// Output:
+	// notify: 0
+	// notify: 1
+	// notified:  2
+	// clone len: 0
+	// orig:      [0 1 2 3 4]
+}
+
 func BenchmarkInsertG(b *testing.B) {
 	b.StopTimer()
 	insertP := rand.Perm(benchmarkTreeSize)
